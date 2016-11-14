@@ -1,0 +1,14 @@
+
+TO-DO : test one last time
+
+
+
+
+
+TO-DO : open mode  try inode mode //done 
+TO-DO : mount/umount for all uncorrect options //done  
+TO-DO : Compile time warnings //done check at last
+TO-DO : get ioctl command //done 
+TO-DO : create single threaded work queue //done
+TO-DO : signature key missing tainting kernel //done  
+TO-DO : mention that you are creating the tfile if it does not exist //done 

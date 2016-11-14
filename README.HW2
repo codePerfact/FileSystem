@@ -1,0 +1,375 @@
+Design Decisions : 
+	kernel tracing :
+	1.	Here we are trying to trace different operations of the filesystem, these traces 
+		we want to write to a file which later on can be used for replay. For this purpose we
+		are taking filepath as mount option and when once this filepath comes, we open it during 
+		mount and attach resulting (file *) to the super_block private data. Now we don't need to open
+		the file every time we need to write the record. we simply take this pointer and write to
+		it. This file * is closed during the umount.
+
+	2.	Since all the operation takes different kind of arguments we have created a generic 
+		structure which contain all the fields which may be required for tracing one or other 
+		operation. below is how this structure looks like.
+
+		struct trfs_record{
+				unsigned int op_type;	
+				mode_t record_mode;
+				unsigned int record_flags;
+				int record_ret_val;
+				unsigned short record_path_len;
+				unsigned short dest_path_len;
+				unsigned int record_buf_len;
+				char * buffer;
+				unsigned int count;
+				char *record_path_name;
+				char *dest_path_name;
+				size_t file_address;
+				struct super_block *sb;
+				dev_t dev;
+			};
+
+	3.	How we trace ?
+		To perform all the functionalities related to this record struct 
+		(getting a blank record - getrecord(), putting this record to file - putrecord())
+		we have created an extra file named "record.c". This I have done to centralize 
+		the code which directly responsible for writing to the file. Now in each operation 
+		we check if this needs to be traced by checking bitmap value (description below) If 
+		yes than, we get a blank record via above getrecord() method. Set all the relevant 
+		fields and call putrecord(), we record relative paths where ever path is there in the 
+		argument so that we can later reply these records in some other directory.
+
+		Threading :
+		putrecord method in record.c do all the writing asynchronously, we have used workqueue 
+		api for this. So putrecord() method do nothing but submit the task to the queue and return 
+		back. That means all the filesystem operations will exit in there normal time. Putrecord() 
+		checks if there is already workqueue defined is no then it creates a single threaded workqueue 
+		and assign the task to it. 
+		There is method __putrecord in record.c which is our thread handler, this is the method 
+		which get executed by the thread for performing the task later on.
+
+
+		__putthread (actual writing to the file) :
+		Record id :
+		We want to associate every record with an unique id, which should be continuously incremental,
+		to achieve this we have attached a atomic variable record_id with the super block private data 
+		during mount and intialize this with 0, inside this __putrecord method we take this atomic variable 
+		record_id increment it and use it for the current record.
+		We calculate the recordsize based on different operations type, and write record id, recordsize 
+		and fields set in passed record structure to the file with the help of a buffer. So the total size 
+		of a single trace comes out to be 
+		sizeof(record id) + sizeof(recordsize) + recordsize
+
+		If any of the above operations fail during tracing or during putrecord they does not affect the 
+		original operation, normal filesystem operations should continue by there normal flow if tracing 
+		fails somewhere it should not affect normal filesystem operations. We have taken buffer size inside 
+		__putrecord to be PAGE_SIZE. [A] we are assuming that no record will exceed the PAGE_SIZE.
+
+	Ioctl support (trctl):
+		1.	The purpose of this ioctl call is to enable/disable the tracing of certain filesystem operations. 
+			For this purpose we have used and integer called bitmap. This is also attached to the superblock private 
+			data pointer during mount with its default value (0xffff). We will show later in document how to use this 
+			ioctl to enable/disable tracing of different operations.
+
+	User program (treplay) :
+		1.	The purpose of this program is to replay the traces that has been recorded in the file system. 
+			This is a user c program which reads the first sizeof(record_id) bytes from the file, set the record id, 
+			read next sizeof(record_size) bytes and set the record size, and then read next record_size bytes from the 
+			file into a buffer, now we can identify from first sizeof(op_type) bytes of buffer, which operations trace it is.
+			Based on that operation type we try to replay/print(based on flags passed to treplay) the operations by reading 
+			rest of the buffer for arguments.
+
+		2.	To replay read/write/close and few other operations we need to know the file on which these needs to be 
+			performed. That means there has to be some unique identifier attached with these traces to tell us which file 
+			( among all that we have opened till now ) this operation needs to be performed to. We are using file * address 
+			for this purpose , [A] we are assuming that file pointer that is being passed around in kernel for the operations 
+			on a single file will be unique. Everytime we trace the open we store file struct address and path. 
+			Now when we replay it we keep this mapping file_struct_address -->  file descriptor in a link list. A single node 
+			of this link list looks like :
+			Struct link_list {
+				struct link_list *next;
+				size_t file_addr;
+				int fd;
+			}
+		Every time we open a new file we append a node to this list, when we do read/write/close, we check if 
+		corresponding fd exist in this list, if not we ignore the operation in replay else we replay it using 
+		corresponding file descriptor. If it is a close we remove the corresponding node from the link list.
+
+		At the end we close the files if there are any remaining nodes in the list and free the full link list.
+
+
+		Operations traced and there corresponding bit in bitmap :
+		We have taken bitmap of size 16 bits (2-bytes), of which default value is 0xFFFF,
+
+		Table 1
+
+		    Operation	|	int value	|	Bit value		|	comments
+		--------------------------------------------------------------------
+		1.	OP_OPEN		|	1			|  	0x0001(1<<0)	| file open
+		2.	OP_READ		|	2			| 	0x0002(1<<1)	| file read
+		3.	OP_WRITE	| 	4			|	0x0004(1<<2)	| file write
+		4.	OP_CLOSE 	|	8			|	0x0008(1<<3)	| file close
+		5.	OP_LINK		|	16			| 	0x0010(1<<4) 	| create hardlink
+		6.	OP_UNLINK 	| 	32			|	0x0020(1<<5) 	| unlink system call
+		7.	OP_SYMLINK	|	64			|	0x0040(1<<6)	| symlink system call
+		8.	OP_MKDIR	|	128			|	0x0080(1<<7) 	| mkdir system call
+		9.	OP_RMDIR	|	256			|	0x0100(1<<8) 	| rmdir system call
+		10.	OP_MKNOD 	|	512			|	0x0200(1<<9) 	| mknod system call
+		11.	OP_RENAME 	|	1024		|	0x0400 (1<<10)	| rename system call
+		12.	OP_READLN	|	2048		|	0x0800(1<<11)	| readlink system call
+	
+	Testing :
+		For testing/checking almost all the functionality of this code I will try to write 
+		the steps/testcases, feel free to follow these or play around with these.
+
+
+	Preprocessing :
+
+		clone : git clone ssh://USER@scm.cs.stonybrook.edu:130/scm/cse506git-f16/hw2- shilgupta
+
+		cd  (where ever cloned)/hw2-shilgupta
+
+		make
+
+		make modules_Install
+
+		make install
+
+		reboot
+
+		Now the kernel should be installed in the machine, while reboot choose kernel 4.6.0+.
+
+		cd (where ever cloned)/hw2-shilgupta/fs/trfs
+
+		make (build all the code)
+		( make user : can be used to build only user program (treplay) )
+		( make ioctl : can be used to build only trctl)
+
+		Now we need to choose a directory which we want to mount 
+		Let's make a directory for this
+
+		mkdir /usr/tmp/mountpoint
+		touch /usr/tmp/mountpoint/test.txt
+		echo "this is the text for testing" > /usr/tmp/mountpoint/test.txt
+
+		we need to create a tfile which we will be writing traces to, lets create it
+		touch /tmp/tfile
+
+		[A] even if we do not create tfile it will be created while mounting based on the path 
+		Given in mount option.
+		Remove if any of above file, directory already exists, create a fresh one.
+
+		insmod trfs.ko
+		
+		Let's try to pass invalid values to mount
+		mount -t nonexistfs -o tfile=/tmp/tfile /usr/tmp/mountpoint /mnt/trfs (mount: unknown filesystem type)
+		mount -t trfs -o tfile=/tmp/tfile /nonexistance/dir/path /mnt/trfs (device does not exist)
+		mount -t trfs -o tfile=/tmp/tfile /usr/tmp/mountpoint /nonexistance/dir/path (mount point does not exist)
+		
+		Let's mount now
+		mount -t trfs -o tfile=/tmp/tfile /usr/tmp/mountpoint /mnt/trfs
+
+		now our file system has been mounted.
+
+		By default bitmap is set to 0xFFFF, so all the operations mentioned in the table  1 are going to be traced.
+
+		Let's first see if umount also is smooth
+		umount /mnt/trfs 
+		rmmod trfs
+
+		Now our filesystem is mounting/umounting smoothly, Let reinsert the module and mount trfs again
+		To check other functionalities
+
+		insmod trfs.ko
+		mount -t trfs -o tfile=/tmp/tfile /usr/tmp/mountpoint /mnt/trfs
+
+		to check whether tfile has been successfully passed to the filesystem check dmesg, if it has 
+		not been passed properly it will show below line in dmesg
+		filename passing from read super to preprocess : (null)
+
+		If you see above msg umount the file system and mount it again with correct syntax 
+		( mount -t trfs -o tfile=/tmp/tfile /usr/tmp/mountpoint /mnt/trfs)
+
+		If tfile has been successfully passed to the kernel you will see below msg in dmesg
+		filename passing from read super to preprocess : tfile=/tmp/tfile
+
+		That means tfile has been successfully passed to the kernel (all is well).
+		Before invoking any system calls, lets create a copy of this mounted directory so 
+		that we can replay the system call again
+		cp -r /mnt/trfs /mnt/trfscopy 
+
+
+		Now we are ready to invoke different system calls to check the tracing.
+
+		cd /mnt/trfs
+		check OP_OPEN/OP_READ/OP_CLOSE:
+			ls
+			cat test.txt
+			now we cat check dmesg to see if records have been traced 
+			also we can check size of tfile
+			ls -la /tmp/tfile
+			to ensure that the size has been increased
+
+
+		check OP_WRITE:
+			echo "appending more text" >> test.txt
+			cat test.txt to see if text appending worked fine
+			check dmesg or size of tfile if needed as above
+
+		check OP_LINK :
+			ln test.txt thisislinktotest1
+			ln test.txt thisislinktotest2
+			ls -la
+			check dmesg/tfile size
+
+		check OP_UNLINK :
+			unlink thisislinktotest1
+			ls -la
+			check dmesg/tfile size
+
+		check OP_SYMLINK :
+			ln -s test.txt thisisasymlink
+			ls -la
+			check dmesg/tfile size
+
+		check OP_MKDIR:
+			mkdir dir1
+			mkdir dir2
+			ls -la
+			check dmesg/tfile size
+
+		check OP_RMDIR:
+			rmdir dir1
+			ls -la
+			check dmesg/tfile size
+
+		check OP_MKNOD :
+			mknod dev p
+			ls
+			check dmesg/tfile size
+
+		check OP_RENAME:
+			mv dir2 renameddir2
+			ls
+			check dmesg/tfile size
+
+		check OP_READLN
+			readlink thisisasymlink
+			ls
+			check dmesg/tfile size
+		
+		check OP_OPEN for create:
+			touch newfile
+			ls
+			check dmesg/tfile size
+
+
+	We have traced all the operations now, everything above should work smoothly.
+	cd  (where ever cloned)/hw2-shilgupta/fs/trfs/
+	lets copy treplay binary to trfscopy so that we can replay these actions again
+
+	cp treplay /mnt/trfscopy/
+ 
+	cd /mnt/trfscopy/
+
+	treplay can take 2 options either  -n or -s check for any other option is should give proper error
+	below are few cases to try (don't replay yet so don't do |./treplay /tmp/tfile| or |./treplay -s /tmp/tfile|
+
+
+	./treplay -blah /tmp/tfile (invalid option)
+	./treplay (invalid no of arg)
+	./treplay -n -s /tmp/tfile (invalid combination)
+
+
+	Now lets try to see what all operations have been traced
+	./treplay -n /tmp/tfile
+
+	(For me around 90 records have been traced I did ls many times in between)
+	Check if record ids are in order / not duplicate
+	
+	[A] while replaying there might be many out of sequence record may come, for example read for a file which we didn't open
+	I am just ignoring these records while replaying. 
+	[A] In strict mode I am aborting when the resulting value of a valid operation which we replayed 
+		does not match with the return value that corresponding fs operation. 
+
+	Lets replay all of them with out strict more
+	./treplay /tmp/tfile
+
+	Lets see how this copy directory looks like now
+	ls
+
+		
+	lets try to see if this copy directory is same as the one we mounted out filesystem on
+	diff -ruN /usr/tmp/mountpoint/ /mnt/trfscopy/
+	this looks same to me other than off course treplay binary which I copied to this trfscopy to replay the records.
+	lets do 
+	ls -la /usr/tmp/mountpoint/
+	and 
+	ls -la /mnt/trfscopy/
+	 
+	
+	Check trctl : 
+		Trctl do 2 kind of operations
+		Set the bitmap and get/display the bitmap
+		cd (cloned hw dir)/hw2-shilgupta/fs/trfs
+		
+		Let's first test trctl with all kind or arguments
+			./trctl blah
+			./trctl blah /mnt/trfs
+			./trctl blah blah /mnt/trfs
+			./trctl 87gc /mnt/trfs
+			./trctl hihi /mnt/trfs
+			./trctl 0xhihikkl /mnt/trfs
+			./trctl 0xgggg /mnt/trfs
+
+			./trctl /mnt/trfs
+			Output :
+			bitmap : ffff (because this is default value)
+
+			./trctl none /mnt/trfs
+			./trctl /mnt/trfs
+			Bitmap : 0 (none sets the bitmap to 0 that means no fs operation should be traced)
+			
+		Let's check if bitmap is actually sets to 0
+			we will do 
+			ls -la /tmp/tfile 
+			note down the size of tfile let say it is X 
+			cd /mnt/trfs
+			do ls/mkdir/readlink/etc..
+			do again ls -la /tmp/tfile
+			this size of tfile should still be X
+			
+		Let's now try to partialy activate tracing
+			For Activate/deactivate tracing for different operations or (|) of corresponding bitvalues 
+			(from table 1) can be passed to this. 
+		
+		Let's deactivate OP_WRITE
+		cd ..../hw2-shilgupta/fs/trfs 
+		./trctl 0xFFFB /mnt/trfs
+		./trctl /mnt/trfs
+		cd /mnt/trfs
+		echo "testing trctl" >> test.txt
+		
+		now lets try to replay these traces and see if contain of test.txt changes in copy directory
+		cd /mnt/trfscopy/
+		./treplay /tmp/tfile
+		cat test.txt
+		"testing trctl" has not been added to this that mean write was not traced
+		
+		Same as above different scenario's of trctl can be verified.
+		
+	Now we can do umount /mnt/trfs and rmmod trfs
+
+		[A] : these are are assumptions that i have made. 
+			
+
+	
+
+
+
+
+
+
+
+
+ 
+
